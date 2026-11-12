@@ -1,0 +1,19 @@
+{
+  beforePack: "./scripts/noop-before-pack.mjs",
+  // 壁纸是 renderer 运行时要读的资源，必须随包分发（原版靠 extraResources 拷贝）。
+  extraResources: [
+    { from: "public/wallpapers", to: "assets/wallpapers" }
+  ],
+  npmRebuild: false,
+  buildDependenciesFromSource: false,
+  asar: true,
+  asarUnpack: [
+    "node_modules/ffmpeg-static/**",
+    "node_modules/ffprobe-static/**",
+    "node_modules/uiohook-napi/**",
+    "node_modules/sherpa-onnx-*/**",
+    "electron/native/bin/**"
+  ],
+  directories: { app: "pack-staging", output: "release-140" },
+  win: { target: [{ target: "dir", arch: ["x64"] }] },
+}

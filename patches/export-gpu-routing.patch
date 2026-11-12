@@ -1,0 +1,149 @@
+diff --git a/electron/ipc/nativeVideoArgs/encoding.ts b/electron/ipc/nativeVideoArgs/encoding.ts
+index 48f5cfc..be1e594 100644
+--- a/electron/ipc/nativeVideoArgs/encoding.ts
++++ b/electron/ipc/nativeVideoArgs/encoding.ts
+@@ -145,7 +145,7 @@ export function buildNativeVideoExportArgs(
+ 		"-i",
+ 		"pipe:0",
+ 		"-vf",
+-		`vflip,${FFMPEG_FULL_TO_VIDEO_RANGE_FILTER}`,
++		`${FFMPEG_FULL_TO_VIDEO_RANGE_FILTER}`,
+ 		"-an",
+ 		"-c:v",
+ 		encoder,
+@@ -298,3 +298,4 @@ export function buildNativeH264StreamExportArgs(config: {
+ 		config.outputPath,
+ 	];
+ }
++
+diff --git a/src/lib/exporter/modernNativeStreamFrames.ts b/src/lib/exporter/modernNativeStreamFrames.ts
+index 3948c48..dbd2575 100644
+--- a/src/lib/exporter/modernNativeStreamFrames.ts
++++ b/src/lib/exporter/modernNativeStreamFrames.ts
+@@ -31,14 +31,9 @@ export function captureRawvideoFrame(session: Session, _hooks: Hooks): Uint8Arra
+ 	if (!ctx) throw new Error("Canvas readback is unavailable for bundled FFmpeg export");
+ 	ctx.drawImage(source, 0, 0);
+ 	const pixels = ctx.getImageData(0, 0, width, height).data;
+-	const bytes = new Uint8Array(width * height * 4);
+-	// Native FFmpeg's established rawvideo path applies vflip. Feed bottom-up
+-	// RGBA consistently; Canvas2D readback is always top-down on every backend.
+-	const stride = width * 4;
+-	for (let row = 0; row < height; row++) {
+-		bytes.set(pixels.subarray(row * stride, (row + 1) * stride), (height - row - 1) * stride);
+-	}
+-	return bytes;
++	// Canvas2D 回读本身就是 top-down，ffmpeg 侧已不再做 vflip，因此这里直接按原样输出，
++	// 省掉一遍整帧行拷贝（1440p 每帧约 14.7 MB）。
++	return new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+ }
+ 
+ export async function encodeRenderedFrameNative(
+diff --git a/src/lib/exporter/modernNativeStreamStart.ts b/src/lib/exporter/modernNativeStreamStart.ts
+index 8a9116c..25dad0a 100644
+--- a/src/lib/exporter/modernNativeStreamStart.ts
++++ b/src/lib/exporter/modernNativeStreamStart.ts
+@@ -28,6 +28,47 @@ export async function tryStartNativeVideoExport(session: Session, hooks: Hooks):
+ 	}
+ }
+ 
++/**
++ * ffmpeg 侧真正跑在专用硬件上的编码器。
++ * 故意不含 h264_mf：它只是 Media Foundation 的通用封装，在没有硬件 MFT 的机器上
++ * （例如 AMD 独显/核显）会静默退回软件编码，把它当硬件会误判。
++ */
++export function isHardwareFfmpegEncoderName(name: string | null | undefined): boolean {
++	if (!name) return false;
++	return /nvenc|qsv|amf|videotoolbox|vaapi/i.test(name);
++}
++
++/**
++ * 问 Chromium：这条 H.264 编码配置是否真的由硬件完成。
++ * `powerEfficient` 是 MediaCapabilities 里专门表达"硬件加速"的信号；WebCodecs 的
++ * `isConfigSupported` 只说明"能编"，在 AMD 上会返回 true 却实际软编，因此不能只看它。
++ */
++export async function isWebCodecsHardwareAccelerated(config: {
++	width: number;
++	height: number;
++	bitrate: number;
++	frameRate: number;
++	codec?: string;
++}): Promise<boolean> {
++	const mediaCapabilities = globalThis.navigator?.mediaCapabilities;
++	if (!mediaCapabilities?.encodingInfo) return false;
++	try {
++		const info = await mediaCapabilities.encodingInfo({
++			type: "record",
++			video: {
++				contentType: `video/mp4; codecs="${config.codec ?? "avc1.640034"}"`,
++				width: config.width,
++				height: config.height,
++				bitrate: config.bitrate,
++				framerate: config.frameRate,
++			},
++		});
++		return info.powerEfficient === true;
++	} catch {
++		return false;
++	}
++}
++
+ export async function startNativeVideoExport(session: Session, hooks: Hooks): Promise<boolean> {
+ 	session.native.lastNativeExportError = null;
+ 
+@@ -54,6 +95,31 @@ export async function startNativeVideoExport(session: Session, hooks: Hooks): Pr
+ 	if (session.native.forceRawvideoNativeRetry) {
+ 		return startRawvideoNativeExport(session, hooks, "Browser H.264 encoding failed");
+ 	}
++
++	// WebCodecs 在不少机器上"支持但软编"（AMD 上实测 prefer-hardware 比 prefer-software 还慢）。
++	// 这种情况下直接让 ffmpeg 用真正的硬件编码器（AMF/NVENC/QSV），CPU 能少一个数量级。
++	const webCodecsHasHardware = await isWebCodecsHardwareAccelerated({
++		width: session.config.width,
++		height: session.config.height,
++		bitrate: session.config.bitrate,
++		frameRate: session.config.frameRate,
++	});
++	if (!webCodecsHasHardware) {
++		const usedHardwareEncoder = await startRawvideoNativeExport(
++			session,
++			hooks,
++			"WebCodecs H.264 has no hardware acceleration on this GPU",
++			{ requireHardwareEncoder: true },
++		);
++		if (usedHardwareEncoder) {
++			console.log(
++				`[VideoExporter] ${NATIVE_EXPORT_ENGINE_NAME}: WebCodecs 无硬件加速，改用 ffmpeg 硬件编码（${session.metrics.encoderName}）`,
++			);
++			return true;
++		}
++		if (session.cancelled) return false;
++	}
++
+ 	let encoderConfig: VideoEncoderConfig = {
+ 		codec: "avc1.640034",
+ 		width: session.config.width,
+@@ -200,6 +266,7 @@ export async function startRawvideoNativeExport(
+ 	session: Session,
+ 	_hooks: Hooks,
+ 	reason: string,
++	options: { requireHardwareEncoder?: boolean } = {},
+ ): Promise<boolean> {
+ 	if (session.cancelled) return false;
+ 	const result = await window.electronAPI.nativeVideoExportStart({
+@@ -217,6 +284,16 @@ export async function startRawvideoNativeExport(
+ 		if (result.sessionId) await window.electronAPI.nativeVideoExportCancel?.(result.sessionId);
+ 		return false;
+ 	}
++	// 只在"确认拿到硬件编码器"时才采用这个会话；否则立刻取消，避免用 libx264 软编
++	// 白跑一趟（那样比 WebCodecs 软编更慢，因为还多了每帧的回读开销）。
++	if (options.requireHardwareEncoder && result.sessionId && !isHardwareFfmpegEncoderName(result.encoderName)) {
++		await window.electronAPI.nativeVideoExportCancel?.(result.sessionId);
++		session.native.lastNativeExportError = `${reason}. ffmpeg 只提供了软件编码器（${result.encoderName ?? "unknown"}）`;
++		console.log(
++			`[VideoExporter] ${NATIVE_EXPORT_ENGINE_NAME}: rawvideo 只拿到软编器（${result.encoderName ?? "unknown"}），回退 WebCodecs`,
++		);
++		return false;
++	}
+ 	if (!result.success || !result.sessionId) {
+ 		session.native.lastNativeExportError = `${reason}. Bundled FFmpeg rawvideo fallback: ${result.error || "unavailable"}`;
+ 		return false;

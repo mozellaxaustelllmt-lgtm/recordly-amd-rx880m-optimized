@@ -1,0 +1,1033 @@
+diff --git a/electron/native/wgc-capture/src/main.cpp b/electron/native/wgc-capture/src/main.cpp
+index 0f1748f..da3872d 100644
+--- a/electron/native/wgc-capture/src/main.cpp
++++ b/electron/native/wgc-capture/src/main.cpp
+@@ -13,6 +13,7 @@
+ #include <mutex>
+ #include <condition_variable>
+ #include <chrono>
++#include <cmath>
+ #include <cstdio>
+ #include <fstream>
+ 
+@@ -43,6 +44,13 @@ struct CaptureConfig {
+     int fps = 60;
+     int width = 0;
+     int height = 0;
++    // 输出高度上限（0 = 不缩放）：整屏抓到的分辨率高于它时，在 GPU 上等比缩放后再编码，
++    // 编码像素量随之下降，CPU 占用和发热明显变低。
++    int maxOutputHeight = 0;
++    // 可选：显式指定 ffmpeg.exe 路径（不填则自动找同目录 / ffmpeg-static / PATH）
++    std::string ffmpegPath;
++    // 是否优先用 ffmpeg 的硬件编码器（AMF/NVENC/QSV）；失败自动回落 Media Foundation
++    bool preferHardwareEncoder = true;
+     int displayX = 0;
+     int displayY = 0;
+     int displayW = 0;
+@@ -126,6 +134,20 @@ static bool parseSimpleJson(const std::string& json, CaptureConfig& config) {
+     int height = findInt("height");
+     if (height > 0) config.height = height;
+ 
++    int maxOutputHeight = findInt("maxOutputHeight");
++    if (maxOutputHeight > 0) config.maxOutputHeight = maxOutputHeight;
++
++    config.ffmpegPath = findString("ffmpegPath");
++    const size_t preferPos = json.find("\"preferHardwareEncoder\"");
++    if (preferPos != std::string::npos) {
++        const size_t colon = json.find(':', preferPos);
++        if (colon != std::string::npos) {
++            const size_t valueStart = json.find_first_not_of(" \t", colon + 1);
++            config.preferHardwareEncoder =
++                valueStart != std::string::npos && json.substr(valueStart, 4) == "true";
++        }
++    }
++
+     config.audioOutputPath = findString("audioOutputPath");
+     config.micOutputPath = findString("micOutputPath");
+     config.micDeviceId = findString("micDeviceId");
+@@ -158,11 +180,35 @@ static bool parseSimpleJson(const std::string& json, CaptureConfig& config) {
+     return true;
+ }
+ 
+-static std::wstring utf8ToWide(const std::string& str) {
+-    if (str.empty()) return L"";
+-    int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
+-    std::wstring wstr(len, L'\0');
+-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &wstr[0], len);
++/** 宽字符串 → UTF-8。给 Electron 解析 stdout 用（它按 UTF-8 解码）。 */
++static std::string wideToUtf8(const std::wstring& str) {
++    if (str.empty()) return "";
++    const int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()),
++                                        nullptr, 0, nullptr, nullptr);
++    if (len <= 0) return "";
++    std::string out(static_cast<size_t>(len), '\0');
++    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len,
++                        nullptr, nullptr);
++    return out;
++}
++
++static std::wstring utf8ToWide(const std::string& str) {    if (str.empty()) return L"";
++
++    // Electron/Node 把 JSON 当命令行参数传进来时，CRT 会在中文系统上把它转成 ANSI(GBK) 字节，
++    // 这里如果一律按 UTF-8 解，路径里有中文（例如 C:\Users\顾磊\...）就会变成乱码，
++    // MFCreateSinkWriterFromURL 直接报 0x80070003 —— 这是原生采集起不来、退回浏览器录制的根因。
++    // 做法：先按 UTF-8 严格解析，失败再按系统 ANSI 代码页解析。
++    UINT codePage = CP_UTF8;
++    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(),
++                                  static_cast<int>(str.size()), nullptr, 0);
++    if (len == 0) {
++        codePage = CP_ACP;
++        len = MultiByteToWideChar(CP_ACP, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
++    }
++    if (len == 0) return L"";
++
++    std::wstring wstr(static_cast<size_t>(len), L'\0');
++    MultiByteToWideChar(codePage, 0, str.c_str(), static_cast<int>(str.size()), &wstr[0], len);
+     return wstr;
+ }
+ 
+@@ -332,18 +378,36 @@ int main(int argc, char* argv[]) {
+         }
+     }
+ 
+-    int captureWidth = config.width > 0 ? config.width : session.captureWidth();
+-    int captureHeight = config.height > 0 ? config.height : session.captureHeight();
++    // 抓屏原始尺寸（窗口录制时 session 已经把窗口裁出来了）
++    const int sourceWidth = session.captureWidth();
++    const int sourceHeight = session.captureHeight();
++
++    // 编码尺寸：默认与抓屏一致；配置里给了 width/height 就用配置；
++    // 再按 maxOutputHeight 做一次等比缩放（等比是为了不变形）。
++    int outputWidth = config.width > 0 ? config.width : sourceWidth;
++    int outputHeight = config.height > 0 ? config.height : sourceHeight;
++
++    if (config.maxOutputHeight > 0 && outputHeight > config.maxOutputHeight) {
++        const double scale = static_cast<double>(config.maxOutputHeight) /
++                             static_cast<double>(outputHeight);
++        outputHeight = config.maxOutputHeight;
++        outputWidth = static_cast<int>(std::lround(static_cast<double>(outputWidth) * scale));
++    }
+ 
+     // Ensure even dimensions for H.264
+-    captureWidth = (captureWidth / 2) * 2;
+-    captureHeight = (captureHeight / 2) * 2;
++    outputWidth = (outputWidth / 2) * 2;
++    outputHeight = (outputHeight / 2) * 2;
++
++    std::cerr << "INFO: capture " << sourceWidth << "x" << sourceHeight
++              << " -> encode " << outputWidth << "x" << outputHeight
++              << "@" << config.fps << "fps" << std::endl;
+ 
+     // Initialize encoder
+     MFEncoder encoder;
+     std::wstring outputPathW = utf8ToWide(config.outputPath);
+-    if (!encoder.initialize(outputPathW, captureWidth, captureHeight, config.fps,
+-                           session.device(), session.context())) {
++    if (!encoder.initialize(outputPathW, outputWidth, outputHeight, config.fps,
++                           session.device(), session.context(), sourceWidth, sourceHeight,
++                           utf8ToWide(config.ffmpegPath), config.preferHardwareEncoder)) {
+         std::cerr << "ERROR: Failed to initialize Media Foundation encoder" << std::endl;
+         return 1;
+     }
+@@ -474,8 +538,11 @@ int main(int argc, char* argv[]) {
+         return 1;
+     }
+ 
++    // 注意：这一行会被 Recordly 的正则解析成临时文件路径（waitForWindowsCaptureStop），
++    // 而 Node 端按 UTF-8 解码管道，所以必须输出 UTF-8，否则含中文的路径会变成乱码，
++    // 后续 rename 就会报 ENOENT("no such file or directory")。
+     std::cout << (interrupted ? "Recording interrupted. Output path: " : "Recording stopped. Output path: ")
+-              << config.outputPath << std::endl;
++              << wideToUtf8(outputPathW) << std::endl;
+     if (audioActive) {
+         if (
+             loopback.dataDiscontinuityCount() > 0 ||
+@@ -495,7 +562,7 @@ int main(int argc, char* argv[]) {
+                       << " compactedSilentDiscontinuityFrames=" << loopback.compactedSilentDiscontinuityFrames()
+                       << std::endl;
+         }
+-        std::cout << "Audio path: " << config.audioOutputPath << std::endl;
++        std::cout << "Audio path: " << wideToUtf8(utf8ToWide(config.audioOutputPath)) << std::endl;
+     }
+     if (micActive) {
+         if (
+@@ -516,7 +583,7 @@ int main(int argc, char* argv[]) {
+                       << " compactedSilentDiscontinuityFrames=" << micCapture.compactedSilentDiscontinuityFrames()
+                       << std::endl;
+         }
+-        std::cout << "Mic path: " << config.micOutputPath << std::endl;
++        std::cout << "Mic path: " << wideToUtf8(utf8ToWide(config.micOutputPath)) << std::endl;
+     }
+     std::cout.flush();
+ 
+@@ -526,3 +593,6 @@ int main(int argc, char* argv[]) {
+     // Fast exit to avoid WinRT/COM teardown crashes during apartment cleanup
+     ExitProcess(interrupted ? 1 : 0);
+ }
++
++
++
+diff --git a/electron/native/wgc-capture/src/mf_encoder.cpp b/electron/native/wgc-capture/src/mf_encoder.cpp
+index 990c686..7a28988 100644
+--- a/electron/native/wgc-capture/src/mf_encoder.cpp
++++ b/electron/native/wgc-capture/src/mf_encoder.cpp
+@@ -4,15 +4,19 @@
+ #include <mferror.h>
+ #include <codecapi.h>
+ #include <algorithm>
++#include <cmath>
+ #include <cstdint>
+-#include <iostream>
+ #include <cstring>
++#include <iostream>
++#include <sstream>
++#include <vector>
+ #include "../../common/bt709_video.h"
+ 
+ #pragma comment(lib, "mfplat.lib")
+ #pragma comment(lib, "mfreadwrite.lib")
+ #pragma comment(lib, "mf.lib")
+ #pragma comment(lib, "mfuuid.lib")
++#pragma comment(lib, "d3d11.lib")
+ 
+ static UINT32 calculateScreenRecordingBitrate(int width, int height, int fps) {
+     constexpr uint64_t kFourKPixels = 3840ULL * 2160ULL;
+@@ -33,6 +37,89 @@ static UINT32 calculateScreenRecordingBitrate(int width, int height, int fps) {
+     return static_cast<UINT32>(static_cast<double>(baseBitrate) * boost + 0.5);
+ }
+ 
++namespace {
++
++std::wstring exeDirectory() {
++    wchar_t buffer[4096] = {};
++    const DWORD len = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
++    if (len == 0 || len >= std::size(buffer)) return std::wstring();
++    std::wstring path(buffer, len);
++    const size_t slash = path.find_last_of(L"\\/");
++    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
++}
++
++bool fileExists(const std::wstring& path) {
++    const DWORD attrs = GetFileAttributesW(path.c_str());
++    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
++}
++
++std::wstring joinPath(const std::wstring& dir, const wchar_t* leaf) {
++    if (dir.empty()) return leaf;
++    std::wstring out = dir;
++    if (out.back() != L'\\' && out.back() != L'/') out.push_back(L'\\');
++    out += leaf;
++    return out;
++}
++
++/** 隐藏窗口跑一个短命令，返回退出码（-1 表示起不来）。用于探测硬件编码器。 */
++int runHidden(const std::wstring& exePath, const std::wstring& args, DWORD timeoutMs) {
++    if (exePath.empty()) return -1;
++
++    SECURITY_ATTRIBUTES sa = {};
++    sa.nLength = sizeof(sa);
++    sa.bInheritHandle = TRUE;
++
++    HANDLE nulIn = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
++                               OPEN_EXISTING, 0, nullptr);
++    HANDLE nulOut = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
++                                OPEN_EXISTING, 0, nullptr);
++
++    STARTUPINFOW si = {};
++    si.cb = sizeof(si);
++    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
++    si.wShowWindow = SW_HIDE;
++    si.hStdInput = nulIn;
++    si.hStdOutput = nulOut;
++    si.hStdError = nulOut;
++
++    std::wstring commandLine = args;
++    std::vector<wchar_t> buffer(commandLine.begin(), commandLine.end());
++    buffer.push_back(L'\0');
++
++    PROCESS_INFORMATION pi = {};
++    const BOOL started = CreateProcessW(exePath.c_str(), buffer.data(), nullptr, nullptr, TRUE,
++                                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
++    int exitCode = -1;
++    if (started) {
++        if (WaitForSingleObject(pi.hProcess, timeoutMs) == WAIT_OBJECT_0) {
++            DWORD code = 1;
++            if (GetExitCodeProcess(pi.hProcess, &code)) {
++                exitCode = static_cast<int>(code);
++            }
++        } else {
++            TerminateProcess(pi.hProcess, 1);
++        }
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++    }
++
++    if (nulIn != INVALID_HANDLE_VALUE) CloseHandle(nulIn);
++    if (nulOut != INVALID_HANDLE_VALUE) CloseHandle(nulOut);
++    return exitCode;
++}
++
++std::string narrow(const std::wstring& text) {
++    std::string out;
++    out.reserve(text.size());
++    for (const wchar_t ch : text) {
++        out.push_back(static_cast<char>(ch < 128 ? ch : '?'));
++    }
++    return out;
++}
++
++}  // namespace
++
++
+ MFEncoder::MFEncoder() {}
+ 
+ MFEncoder::~MFEncoder() {
+@@ -40,7 +127,10 @@ MFEncoder::~MFEncoder() {
+ }
+ 
+ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height, int fps,
+-                           ID3D11Device* device, ID3D11DeviceContext* context) {
++                           ID3D11Device* device, ID3D11DeviceContext* context,
++                           int inputWidth, int inputHeight,
++                           const std::wstring& ffmpegPath,
++                           bool preferHardwareEncoder) {
+     std::lock_guard<std::mutex> lock(mutex_);
+ 
+     if (initialized_) return false;
+@@ -57,6 +147,8 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+ 
+     width_ = width;
+     height_ = height;
++    inputWidth_ = inputWidth > 0 ? inputWidth : width;
++    inputHeight_ = inputHeight > 0 ? inputHeight : height;
+     fps_ = fps;
+     device_ = device;
+     context_ = context;
+@@ -67,6 +159,36 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+         return false;
+     }
+ 
++    const UINT32 videoBitrate = calculateScreenRecordingBitrate(width_, height_, fps_);
++    std::cerr << "Encoder bitrate: " << videoBitrate << " bps for "
++              << width_ << "x" << height_ << "@" << fps_ << "fps" << std::endl;
++
++    // 优先把编码交给 ffmpeg 的硬件编码器（AMF / NVENC / QSV）：
++    // Media Foundation 在 AMD 上只有软件 H.264，实测是录制时最大的 CPU 开销。
++    if (preferHardwareEncoder) {
++        std::vector<std::wstring> candidates;
++        if (!ffmpegPath.empty()) candidates.push_back(ffmpegPath);
++        for (const auto& candidate : findFfmpegCandidates()) candidates.push_back(candidate);
++
++        for (const auto& candidate : candidates) {
++            const std::wstring encoder = probeHardwareEncoder(candidate);
++            if (encoder.empty()) continue;
++            if (startFfmpegPipe(outputPath, candidate, encoder)) {
++                pipeMode_ = true;
++                hardwareEncoderName_ = encoder;
++                std::cerr << "INFO: hardware encoder " << narrow(encoder) << " via "
++                          << narrow(candidate) << std::endl;
++                break;
++            }
++            std::cerr << "WARNING: ffmpeg pipe start failed for " << narrow(candidate) << std::endl;
++        }
++        if (!pipeMode_) {
++            std::cerr << "INFO: no usable hardware encoder, falling back to Media Foundation"
++                      << std::endl;
++        }
++    }
++
++    if (!pipeMode_) {
+     // Output media type (H.264)
+     ComPtr<IMFMediaType> outputType;
+     hr = MFCreateMediaType(&outputType);
+@@ -74,7 +196,6 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+ 
+     outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+     outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+-    const UINT32 videoBitrate = calculateScreenRecordingBitrate(width_, height_, fps_);
+     outputType->SetUINT32(MF_MT_AVG_BITRATE, videoBitrate);
+     MFSetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, width_, height_);
+     MFSetAttributeRatio(outputType.Get(), MF_MT_FRAME_RATE, fps_, 1);
+@@ -82,8 +203,6 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+     outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+     hr = setBt709LimitedVideoAttributes(outputType.Get());
+     if (FAILED(hr)) return false;
+-    std::cerr << "Encoder bitrate: " << videoBitrate << " bps for "
+-              << width_ << "x" << height_ << "@" << fps_ << "fps" << std::endl;
+ 
+     // Input media type (NV12)
+     ComPtr<IMFMediaType> inputType;
+@@ -129,8 +248,9 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+         std::cerr << "ERROR: BeginWriting failed: 0x" << std::hex << hr << std::endl;
+         return false;
+     }
++    }  // if (!pipeMode_)
+ 
+-    // Pre-allocate staging texture
++    // Pre-allocate staging texture（CPU 回退路径用）
+     D3D11_TEXTURE2D_DESC stagingDesc = {};
+     stagingDesc.Width = width_;
+     stagingDesc.Height = height_;
+@@ -149,7 +269,7 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+ 
+     // WGC window captures can change frame size while recording. Keep the muxer
+     // output dimensions stable by compositing resized frames into this fixed
+-    // BGRA surface before CPU readback.
++    // BGRA surface before CPU readback.（仅 CPU 回退路径使用）
+     D3D11_TEXTURE2D_DESC compositeDesc = {};
+     compositeDesc.Width = width_;
+     compositeDesc.Height = height_;
+@@ -172,22 +292,398 @@ bool MFEncoder::initialize(const std::wstring& outputPath, int width, int height
+         return false;
+     }
+ 
+-    // Pre-allocate NV12 buffer
++    // NV12 输出缓冲：GPU 缩放后再回读，CPU 不再做逐像素转换
+     const int ySize = width_ * height_;
+     const int uvSize = (width_ / 2) * (height_ / 2) * 2;
+-    nv12Buffer_.resize(ySize + uvSize);
++    nv12Buffer_.assign(static_cast<size_t>(ySize + uvSize), 0);
+     lastFrameBuffer_.clear();
+     firstSampleTimeHns_ = -1;
+     lastSampleEndTimeHns_ = -1;
+ 
++    gpuConverterReady_ = initGpuConverter(inputWidth_, inputHeight_);
++    if (gpuConverterReady_) {
++        std::cerr << "INFO: GPU colour conversion enabled ("
++                  << inputWidth_ << "x" << inputHeight_ << " -> "
++                  << width_ << "x" << height_ << ")" << std::endl;
++    } else {
++        std::cerr << "WARNING: GPU colour conversion unavailable, using scalar CPU path" << std::endl;
++    }
++
+     initialized_ = true;
+     return true;
+ }
+ 
+-bool MFEncoder::writeFrame(ID3D11Texture2D* texture, int64_t timestampHns) {
+-    std::lock_guard<std::mutex> lock(mutex_);
++std::vector<std::wstring> MFEncoder::findFfmpegCandidates() {
++    std::vector<std::wstring> candidates;
++    auto push = [&candidates](const std::wstring& path) {
++        if (path.empty() || !fileExists(path)) return;
++        for (const auto& existing : candidates) {
++            if (existing == path) return;
++        }
++        candidates.push_back(path);
++    };
++
++    const std::wstring dir = exeDirectory();
++    // 1) 与 helper 同目录
++    push(joinPath(dir, L"ffmpeg.exe"));
++
++    // 2) 逐级向上找：node_modules\ffmpeg-static（开发态）与 app.asar.unpacked\node_modules\ffmpeg-static（安装态）
++    std::wstring base = dir;
++    for (int up = 0; up < 6; ++up) {
++        const size_t slash = base.find_last_of(L"\\/");
++        if (slash == std::wstring::npos) break;
++        base = base.substr(0, slash);
++        push(joinPath(base, L"node_modules\\ffmpeg-static\\ffmpeg.exe"));
++        push(joinPath(base, L"app.asar.unpacked\\node_modules\\ffmpeg-static\\ffmpeg.exe"));
++        push(joinPath(base, L"ffmpeg.exe"));
++    }
++
++    // 3) PATH
++    wchar_t found[4096] = {};
++    if (SearchPathW(nullptr, L"ffmpeg.exe", nullptr, static_cast<DWORD>(std::size(found)), found,
++                    nullptr) > 0) {
++        push(std::wstring(found));
++    }
++    return candidates;
++}
++
++std::wstring MFEncoder::probeHardwareEncoder(const std::wstring& ffmpegPath) {
++    // 按 AMD -> NVIDIA -> Intel -> Media Foundation 的顺序试一遍，能出 1 帧就算可用。
++    static const wchar_t* kCandidates[] = {L"h264_amf", L"h264_nvenc", L"h264_qsv", L"h264_mf"};
++    for (const wchar_t* candidate : kCandidates) {
++        std::wstring args =
++            L"-hide_banner -loglevel error -nostdin -f lavfi "
++            L"-i color=c=black:s=640x360:r=30 -frames:v 3 -c:v ";
++        args += candidate;
++        args += L" -f null -";
++        if (runHidden(ffmpegPath, args, 20000) == 0) {
++            return std::wstring(candidate);
++        }
++    }
++    return std::wstring();
++}
++
++bool MFEncoder::startFfmpegPipe(const std::wstring& outputPath, const std::wstring& ffmpegPath,
++                                const std::wstring& encoderName) {
++    if (ffmpegPath.empty() || encoderName.empty()) return false;
++
++    SECURITY_ATTRIBUTES sa = {};
++    sa.nLength = sizeof(sa);
++    sa.bInheritHandle = TRUE;
++
++    HANDLE readEnd = nullptr;
++    HANDLE writeEnd = nullptr;
++    if (!CreatePipe(&readEnd, &writeEnd, &sa, 1 << 20)) {
++        std::cerr << "WARNING: CreatePipe failed: " << GetLastError() << std::endl;
++        return false;
++    }
++    SetHandleInformation(writeEnd, HANDLE_FLAG_INHERIT, 0);
++
++    HANDLE nulIn = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
++                               OPEN_EXISTING, 0, nullptr);
++    // ffmpeg 的报错落到 <输出>.ffmpeg.log，录制失败时能直接看到原因。
++    const std::wstring ffmpegLogPath = outputPath + L".ffmpeg.log";
++    pipeLogPath_ = ffmpegLogPath;
++    HANDLE errOut = CreateFileW(ffmpegLogPath.c_str(), GENERIC_WRITE,
++                                FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, 0, nullptr);
++
++    const UINT32 bitrate = calculateScreenRecordingBitrate(width_, height_, fps_);
++    // 各家的码率控制/质量档参数不一样，按编码器补上，避免默认值把 UI 录成糊的。
++    std::wstring qualityArgs;
++    if (encoderName == L"h264_amf") {
++        qualityArgs = L" -quality balanced -rc cbr";
++    } else if (encoderName == L"h264_nvenc") {
++        qualityArgs = L" -preset p5 -rc cbr";
++    } else if (encoderName == L"h264_qsv") {
++        qualityArgs = L" -preset medium";
++    }
++
++    std::wostringstream args;
++    // 注意：这里绝对不能加 -nostdin，否则 ffmpeg 会忽略 stdin（我们的帧管道），写入会阻塞。
++    args << L" -hide_banner -loglevel error -y"
++         << L" -f rawvideo -pix_fmt nv12 -s " << width_ << L"x" << height_
++         << L" -r " << fps_ << L" -i - -an"
++         << L" -c:v " << encoderName
++         << qualityArgs
++         << L" -b:v " << bitrate
++         << L" -maxrate " << (bitrate * 3 / 2)
++         << L" -bufsize " << (bitrate * 2)
++         << L" -pix_fmt yuv420p"
++         << L" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv"
++         << L" -movflags +frag_keyframe+empty_moov+default_base_moof"
++         << L" -f mp4 \"" << outputPath << L"\"";
++
++    std::wstring commandLine = args.str();
++    std::vector<wchar_t> buffer(commandLine.begin(), commandLine.end());
++    buffer.push_back(L'\0');
++
++    STARTUPINFOW si = {};
++    si.cb = sizeof(si);
++    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
++    si.wShowWindow = SW_HIDE;
++    si.hStdInput = readEnd;
++    si.hStdOutput = errOut != INVALID_HANDLE_VALUE ? errOut : GetStdHandle(STD_OUTPUT_HANDLE);
++    si.hStdError = errOut != INVALID_HANDLE_VALUE ? errOut : GetStdHandle(STD_ERROR_HANDLE);
++
++    PROCESS_INFORMATION pi = {};
++    const BOOL started = CreateProcessW(ffmpegPath.c_str(), buffer.data(), nullptr, nullptr, TRUE,
++                                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
++    CloseHandle(readEnd);
++    if (nulIn != INVALID_HANDLE_VALUE) CloseHandle(nulIn);
++    if (errOut != INVALID_HANDLE_VALUE) CloseHandle(errOut);
++
++    if (!started) {
++        std::cerr << "WARNING: could not start ffmpeg, error " << GetLastError() << std::endl;
++        CloseHandle(writeEnd);
++        return false;
++    }
++
++    std::cerr << "INFO: ffmpeg pid " << pi.dwProcessId << " encoder " << narrow(encoderName)
++              << std::endl;
++
++    pipeStdin_ = writeEnd;
++    pipeProcess_ = pi.hProcess;
++    pipeThread_ = pi.hThread;
++    return true;
++}
++
++bool MFEncoder::writePipeFrames(const std::vector<uint8_t>& frameBuffer, int64_t frameCount) {
++    if (!pipeMode_ || pipeStdin_ == nullptr || frameBuffer.empty() || frameCount <= 0) {
++        return false;
++    }
++    static const int64_t kMaxCatchUpFrames = 600;  // 病态卡顿时的兜底，避免一次性灌几十秒
++    if (frameCount > kMaxCatchUpFrames) frameCount = kMaxCatchUpFrames;
++
++    for (int64_t index = 0; index < frameCount; ++index) {
++        const BYTE* data = frameBuffer.data();
++        DWORD remaining = static_cast<DWORD>(frameBuffer.size());
++        while (remaining > 0) {
++            DWORD written = 0;
++            if (!WriteFile(pipeStdin_, data, remaining, &written, nullptr) || written == 0) {
++                std::cerr << "ERROR: ffmpeg pipe write failed: " << GetLastError() << std::endl;
++                return false;
++            }
++            data += written;
++            remaining -= written;
++        }
++    }
++    return true;
++}
++
++void MFEncoder::closeFfmpegPipe() {
++    if (pipeStdin_ != nullptr) {
++        FlushFileBuffers(pipeStdin_);
++        CloseHandle(pipeStdin_);
++        pipeStdin_ = nullptr;
++    }
++    if (pipeProcess_ != nullptr) {
++        const DWORD wait = WaitForSingleObject(pipeProcess_, 30000);
++        DWORD code = 1;
++        if (wait == WAIT_OBJECT_0 && GetExitCodeProcess(pipeProcess_, &code) && code != 0) {
++            std::cerr << "WARNING: ffmpeg exited with code " << code << std::endl;
++        } else if (wait == WAIT_OBJECT_0 && !pipeLogPath_.empty()) {
++            // 正常结束：删掉空的 ffmpeg 日志，避免在临时目录里留垃圾
++            DeleteFileW(pipeLogPath_.c_str());
++        } else if (wait != WAIT_OBJECT_0) {
++            std::cerr << "WARNING: ffmpeg did not exit in time" << std::endl;
++            TerminateProcess(pipeProcess_, 1);
++        }
++        CloseHandle(pipeProcess_);
++        pipeProcess_ = nullptr;
++    }
++    if (pipeThread_ != nullptr) {
++        CloseHandle(pipeThread_);
++        pipeThread_ = nullptr;
++    }
++    pipeMode_ = false;
++}
++
++bool MFEncoder::initGpuConverter(int inputWidth, int inputHeight) {
++    if (!device_ || !context_) return false;
++    if (inputWidth < 2 || inputHeight < 2) return false;
++    inputWidth_ = inputWidth;
++    inputHeight_ = inputHeight;
++
++    if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&videoDevice_)))) {
++        std::cerr << "INFO: ID3D11VideoDevice unavailable on this device" << std::endl;
++        return false;
++    }
++    if (FAILED(context_->QueryInterface(IID_PPV_ARGS(&videoContext_)))) {
++        std::cerr << "INFO: ID3D11VideoContext unavailable on this device" << std::endl;
++        return false;
++    }
++
++    D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
++    contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
++    contentDesc.InputWidth = static_cast<UINT>(inputWidth);
++    contentDesc.InputHeight = static_cast<UINT>(inputHeight);
++    contentDesc.OutputWidth = static_cast<UINT>(width_);
++    contentDesc.OutputHeight = static_cast<UINT>(height_);
++    contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
++
++    HRESULT hr = videoDevice_->CreateVideoProcessorEnumerator(&contentDesc, &videoProcessorEnumerator_);
++    if (FAILED(hr)) {
++        std::cerr << "INFO: CreateVideoProcessorEnumerator failed: 0x" << std::hex << hr << std::endl;
++        return false;
++    }
++
++    UINT formatSupport = 0;
++    if (FAILED(videoProcessorEnumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM, &formatSupport)) ||
++        (formatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0) {
++        std::cerr << "INFO: video processor cannot take BGRA input" << std::endl;
++        return false;
++    }
++    if (FAILED(videoProcessorEnumerator_->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &formatSupport)) ||
++        (formatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
++        std::cerr << "INFO: video processor cannot output NV12" << std::endl;
++        return false;
++    }
+ 
+-    if (!initialized_ || !sinkWriter_) return false;
++    hr = videoDevice_->CreateVideoProcessor(videoProcessorEnumerator_.Get(), 0, &videoProcessor_);
++    if (FAILED(hr)) {
++        std::cerr << "INFO: CreateVideoProcessor failed: 0x" << std::hex << hr << std::endl;
++        return false;
++    }
++
++    // 桌面抓到的是全范围 BGRA，编码侧要的是有限范围 BT.709（与 bt709_video.h 一致）
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputSpace = {};
++    inputSpace.Usage = 0;
++    inputSpace.RGB_Range = 0;
++    inputSpace.YCbCr_Matrix = 1;
++    inputSpace.YCbCr_xvYCC = 0;
++    inputSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
++    videoContext_->VideoProcessorSetStreamColorSpace(videoProcessor_.Get(), 0, &inputSpace);
++
++    D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputSpace = {};
++    outputSpace.Usage = 0;
++    outputSpace.RGB_Range = 1;
++    outputSpace.YCbCr_Matrix = 1;
++    outputSpace.YCbCr_xvYCC = 0;
++    outputSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
++    videoContext_->VideoProcessorSetOutputColorSpace(videoProcessor_.Get(), &outputSpace);
++    videoContext_->VideoProcessorSetStreamFrameFormat(
++        videoProcessor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
++
++    // NV12 目标纹理（GPU 上）
++    D3D11_TEXTURE2D_DESC targetDesc = {};
++    targetDesc.Width = static_cast<UINT>(width_);
++    targetDesc.Height = static_cast<UINT>(height_);
++    targetDesc.MipLevels = 1;
++    targetDesc.ArraySize = 1;
++    targetDesc.Format = DXGI_FORMAT_NV12;
++    targetDesc.SampleDesc.Count = 1;
++    targetDesc.Usage = D3D11_USAGE_DEFAULT;
++    targetDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
++
++    hr = device_->CreateTexture2D(&targetDesc, nullptr, &nv12TargetTexture_);
++    if (FAILED(hr)) {
++        std::cerr << "INFO: NV12 target texture creation failed: 0x" << std::hex << hr << std::endl;
++        return false;
++    }
++
++    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc = {};
++    outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
++    outputViewDesc.Texture2D.MipSlice = 0;
++    hr = videoDevice_->CreateVideoProcessorOutputView(
++        nv12TargetTexture_.Get(), videoProcessorEnumerator_.Get(), &outputViewDesc, &nv12OutputView_);
++    if (FAILED(hr)) {
++        std::cerr << "INFO: CreateVideoProcessorOutputView failed: 0x" << std::hex << hr << std::endl;
++        return false;
++    }
++
++    // NV12 回读用的 staging 纹理
++    D3D11_TEXTURE2D_DESC stagingDesc = targetDesc;
++    stagingDesc.Usage = D3D11_USAGE_STAGING;
++    stagingDesc.BindFlags = 0;
++    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    stagingDesc.MiscFlags = 0;
++    hr = device_->CreateTexture2D(&stagingDesc, nullptr, &nv12StagingTexture_);
++    if (FAILED(hr)) {
++        std::cerr << "INFO: NV12 staging texture creation failed: 0x" << std::hex << hr << std::endl;
++        return false;
++    }
++
++    return true;
++}
++
++bool MFEncoder::convertFrameGpu(ID3D11Texture2D* texture) {
++    if (!gpuConverterReady_ || !texture || !videoDevice_ || !videoContext_ ||
++        !videoProcessor_ || !nv12OutputView_ || !nv12StagingTexture_) {
++        return false;
++    }
++
++    // 窗口录制时用户可能改变窗口大小，WGC 会送来不同尺寸的帧。
++    // 视频处理器是按固定输入尺寸建的，尺寸一变就重建一次，避免 Blt 失败或画面错位。
++    D3D11_TEXTURE2D_DESC sourceDesc = {};
++    texture->GetDesc(&sourceDesc);
++    if (static_cast<int>(sourceDesc.Width) != inputWidth_ ||
++        static_cast<int>(sourceDesc.Height) != inputHeight_) {
++        nv12OutputView_.Reset();
++        nv12TargetTexture_.Reset();
++        nv12StagingTexture_.Reset();
++        videoProcessor_.Reset();
++        videoProcessorEnumerator_.Reset();
++        if (!initGpuConverter(static_cast<int>(sourceDesc.Width), static_cast<int>(sourceDesc.Height))) {
++            std::cerr << "WARNING: GPU converter rebuild failed for "
++                      << sourceDesc.Width << "x" << sourceDesc.Height << std::endl;
++            gpuConverterReady_ = false;
++            return false;
++        }
++        std::cerr << "INFO: GPU converter rebuilt for "
++                  << inputWidth_ << "x" << inputHeight_ << std::endl;
++    }
++
++    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc = {};
++    inputViewDesc.FourCC = 0;
++    inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
++    inputViewDesc.Texture2D.MipSlice = 0;
++    inputViewDesc.Texture2D.ArraySlice = 0;
++
++    ComPtr<ID3D11VideoProcessorInputView> inputView;
++    HRESULT hr = videoDevice_->CreateVideoProcessorInputView(
++        texture, videoProcessorEnumerator_.Get(), &inputViewDesc, &inputView);
++    if (FAILED(hr)) return false;
++
++    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
++    stream.Enable = TRUE;
++    stream.OutputIndex = 0;
++    stream.InputFrameOrField = 0;
++    stream.pInputSurface = inputView.Get();
++
++    hr = videoContext_->VideoProcessorBlt(videoProcessor_.Get(), nv12OutputView_.Get(), 0, 1, &stream);
++    if (FAILED(hr)) return false;
++
++    context_->CopyResource(nv12StagingTexture_.Get(), nv12TargetTexture_.Get());
++
++    D3D11_MAPPED_SUBRESOURCE mapped = {};
++    hr = context_->Map(nv12StagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
++    if (FAILED(hr)) return false;
++
++    const auto* yPlane = static_cast<const uint8_t*>(mapped.pData);
++    // 平面格式的 DepthPitch 是 U/V 平面相对 Y 平面的偏移；个别驱动给 0，兜底用 RowPitch*height。
++    size_t uvOffset = static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(height_);
++    if (mapped.DepthPitch > uvOffset) uvOffset = static_cast<size_t>(mapped.DepthPitch);
++    const auto* uvPlane = yPlane + uvOffset;
++
++    uint8_t* dstY = nv12Buffer_.data();
++    for (int row = 0; row < height_; ++row) {
++        std::memcpy(dstY + static_cast<size_t>(row) * width_,
++                    yPlane + static_cast<size_t>(row) * mapped.RowPitch,
++                    static_cast<size_t>(width_));
++    }
++    uint8_t* dstUv = nv12Buffer_.data() + static_cast<size_t>(width_) * height_;
++    for (int row = 0; row < height_ / 2; ++row) {
++        std::memcpy(dstUv + static_cast<size_t>(row) * width_,
++                    uvPlane + static_cast<size_t>(row) * mapped.RowPitch,
++                    static_cast<size_t>(width_));
++    }
++
++    context_->Unmap(nv12StagingTexture_.Get(), 0);
++    return true;
++}
++
++bool MFEncoder::convertFrameCpu(ID3D11Texture2D* texture) {
++    if (!stagingTexture_ || !context_ || !texture) return false;
+ 
+     D3D11_TEXTURE2D_DESC sourceDesc = {};
+     texture->GetDesc(&sourceDesc);
+@@ -233,6 +729,30 @@ bool MFEncoder::writeFrame(ID3D11Texture2D* texture, int64_t timestampHns) {
+     convertBgraToBt709LimitedNv12(bgra, bgraPitch, width_, height_, nv12Buffer_);
+ 
+     context_->Unmap(stagingTexture_.Get(), 0);
++    return true;
++}
++
++bool MFEncoder::writeFrame(ID3D11Texture2D* texture, int64_t timestampHns) {
++    std::lock_guard<std::mutex> lock(mutex_);
++
++    // 管道模式下 sinkWriter_ 为空，不能用它当作「已初始化」的判据。
++    if (!initialized_) return false;
++    if (!pipeMode_ && !sinkWriter_) return false;
++
++    bool converted = false;
++
++    if (gpuConverterReady_) {
++        converted = convertFrameGpu(texture);
++        if (!converted) {
++            std::cerr << "WARNING: GPU colour conversion failed mid-recording, "
++                         "falling back to scalar CPU path" << std::endl;
++            gpuConverterReady_ = false;
++        }
++    }
++    if (!converted && !convertFrameCpu(texture)) {
++        return false;
++    }
++
+ 
+     // WGC may stop delivering frames while the scene is static; keep the MP4
+     // timeline continuous with one duration-bearing sample for each gap.
+@@ -288,7 +808,8 @@ bool MFEncoder::normalizeTimelineTimestampHnsLocked(
+ }
+ 
+ bool MFEncoder::extendLastFrameToLocked(int64_t timestampHns, bool includePartialFrame) {
+-    if (!initialized_ || !sinkWriter_) return false;
++    if (!initialized_) return false;
++    if (!pipeMode_ && !sinkWriter_) return false;
+     if (lastFrameBuffer_.empty()) return false;
+     if (lastSampleEndTimeHns_ < 0) return false;
+ 
+@@ -315,6 +836,15 @@ bool MFEncoder::writeNv12SampleLocked(
+ ) {
+     if (frameBuffer.empty() || durationHns <= 0) return false;
+ 
++    if (pipeMode_) {
++        // 管道模式：rawvideo 没有时间戳，用「重复当前帧」把时长补齐（等价于 CFR）。
++        int64_t frames = (durationHns * static_cast<int64_t>(fps_)) / 10000000LL;
++        if (frames <= 0) frames = 1;
++        if (!writePipeFrames(frameBuffer, frames)) return false;
++        lastSampleEndTimeHns_ = timestampHns + durationHns;
++        return true;
++    }
++
+     // Create MF sample
+     DWORD bufferSize = static_cast<DWORD>(frameBuffer.size());
+     ComPtr<IMFMediaBuffer> buffer;
+@@ -351,18 +881,34 @@ bool MFEncoder::finalize() {
+     std::lock_guard<std::mutex> lock(mutex_);
+ 
+     if (!initialized_) return false;
+-    if (!sinkWriter_) return false;
+ 
+-    HRESULT hr = sinkWriter_->Finalize();
+-    if (FAILED(hr)) {
+-        std::cerr << "ERROR: SinkWriter Finalize failed: 0x" << std::hex << hr << std::endl;
++    bool ok = true;
++    if (pipeMode_) {
++        closeFfmpegPipe();
++    } else if (sinkWriter_) {
++        const HRESULT finalizeHr = sinkWriter_->Finalize();
++        if (FAILED(finalizeHr)) {
++            std::cerr << "ERROR: SinkWriter Finalize failed: 0x" << std::hex << finalizeHr
++                      << std::endl;
++            ok = false;
++        }
++    } else {
++        return false;
+     }
+ 
+     initialized_ = false;
++    gpuConverterReady_ = false;
+     sinkWriter_.Reset();
+     stagingTexture_.Reset();
+     resizeCompositeView_.Reset();
+     resizeCompositeTexture_.Reset();
++    nv12OutputView_.Reset();
++    nv12TargetTexture_.Reset();
++    nv12StagingTexture_.Reset();
++    videoProcessor_.Reset();
++    videoProcessorEnumerator_.Reset();
++    videoContext_.Reset();
++    videoDevice_.Reset();
+     nv12Buffer_.clear();
+     lastFrameBuffer_.clear();
+     nv12Buffer_.shrink_to_fit();
+@@ -370,5 +916,8 @@ bool MFEncoder::finalize() {
+     firstSampleTimeHns_ = -1;
+     lastSampleEndTimeHns_ = -1;
+     MFShutdown();
+-    return SUCCEEDED(hr);
++    return ok;
+ }
++
++
++
+diff --git a/electron/native/wgc-capture/src/mf_encoder.h b/electron/native/wgc-capture/src/mf_encoder.h
+index e2e0642..eb2eb7f 100644
+--- a/electron/native/wgc-capture/src/mf_encoder.h
++++ b/electron/native/wgc-capture/src/mf_encoder.h
+@@ -17,12 +17,25 @@ public:
+     MFEncoder();
+     ~MFEncoder();
+ 
+-    bool initialize(const std::wstring& outputPath, int width, int height, int fps,
+-                    ID3D11Device* device, ID3D11DeviceContext* context);
++    /**
++     * 初始化编码器。
++     *
++     * outWidth/outHeight 是最终写进 MP4 的尺寸；inputWidth/inputHeight 是抓屏来的
++     * 原始尺寸。两者不一致时由 GPU 视频处理器负责缩放（不是裁剪），CPU 只负责
++     * 回读 NV12 与交给 Media Foundation。
++     */
++    bool initialize(const std::wstring& outputPath, int outWidth, int outHeight, int fps,
++                    ID3D11Device* device, ID3D11DeviceContext* context,
++                    int inputWidth, int inputHeight,
++                    const std::wstring& ffmpegPath = L"",
++                    bool preferHardwareEncoder = true);
+     bool writeFrame(ID3D11Texture2D* texture, int64_t timestampHns);
+     bool extendLastFrameTo(int64_t timestampHns);
+     bool finalize();
+ 
++    /** 是否走 GPU 颜色转换（诊断用）。 */
++    bool usesGpuConversion() const { return gpuConverterReady_; }
++
+ private:
+     void normalizeWriteTimestampHnsLocked(int64_t timestampHns, int64_t& normalizedTimestampHns);
+     bool normalizeTimelineTimestampHnsLocked(int64_t timestampHns, int64_t& normalizedTimestampHns) const;
+@@ -30,6 +43,32 @@ private:
+     bool writeNv12SampleLocked(const std::vector<uint8_t>& frameBuffer, int64_t timestampHns,
+                                int64_t durationHns);
+ 
++    /** 建立 D3D11 Video Processor：BGRA -> 有限范围 BT.709 NV12，并做等比缩放。 */
++    bool initGpuConverter(int inputWidth, int inputHeight);
++    /** GPU 路径：一次 VideoProcessorBlt 完成缩放 + 颜色转换，再回读 NV12。 */
++    bool convertFrameGpu(ID3D11Texture2D* texture);
++    /** CPU 回退路径：旧的标量转换（含尺寸不一致时的裁剪）。 */
++    bool convertFrameCpu(ID3D11Texture2D* texture);
++
++    // ---------------------------------------------------------------
++    // 可选：ffmpeg 管道 + 硬件编码器（AMF / NVENC / QSV / MF）
++    // 这台机器上 Media Foundation 只有软件 H.264（实测 2560x1440@60 约 1 核），
++    // 把编码交给 ffmpeg 的 h264_amf 后 CPU 能降到原来的 ~1/10。
++    // ---------------------------------------------------------------
++    static std::vector<std::wstring> findFfmpegCandidates();
++    static std::wstring probeHardwareEncoder(const std::wstring& ffmpegPath);
++    bool startFfmpegPipe(const std::wstring& outputPath, const std::wstring& ffmpegPath,
++                         const std::wstring& encoderName);
++    bool writePipeFrames(const std::vector<uint8_t>& frameBuffer, int64_t frameCount);
++    void closeFfmpegPipe();
++
++    bool pipeMode_ = false;
++    HANDLE pipeStdin_ = nullptr;
++    HANDLE pipeProcess_ = nullptr;
++    HANDLE pipeThread_ = nullptr;
++    std::wstring hardwareEncoderName_;
++    std::wstring pipeLogPath_;
++
+     ComPtr<IMFSinkWriter> sinkWriter_;
+     ID3D11Device* device_ = nullptr;
+     ID3D11DeviceContext* context_ = nullptr;
+@@ -41,9 +80,22 @@ private:
+     DWORD streamIndex_ = 0;
+     int width_ = 0;
+     int height_ = 0;
++    int inputWidth_ = 0;
++    int inputHeight_ = 0;
+     int fps_ = 60;
+     int64_t firstSampleTimeHns_ = -1;
+     int64_t lastSampleEndTimeHns_ = -1;
+     bool initialized_ = false;
++    bool gpuConverterReady_ = false;
+     std::mutex mutex_;
++
++    // D3D11 Video Processor（GPU 缩放 + 颜色转换）
++    ComPtr<ID3D11VideoDevice> videoDevice_;
++    ComPtr<ID3D11VideoContext> videoContext_;
++    ComPtr<ID3D11VideoProcessorEnumerator> videoProcessorEnumerator_;
++    ComPtr<ID3D11VideoProcessor> videoProcessor_;
++    ComPtr<ID3D11Texture2D> nv12TargetTexture_;
++    ComPtr<ID3D11VideoProcessorOutputView> nv12OutputView_;
++    ComPtr<ID3D11Texture2D> nv12StagingTexture_;
+ };
++
+diff --git a/electron/native/wgc-capture/src/wgc_session.cpp b/electron/native/wgc-capture/src/wgc_session.cpp
+index 1dde808..b46cf13 100644
+--- a/electron/native/wgc-capture/src/wgc_session.cpp
++++ b/electron/native/wgc-capture/src/wgc_session.cpp
+@@ -290,6 +290,7 @@ bool WgcSession::startCapture() {
+     capturing_ = true;
+     fatalError_ = false;
+     lastFrameTimeHns_ = 0;
++    nextFrameDueHns_ = 0;
+ 
+     frameArrivedRevoker_ = framePool_.FrameArrived(
+         winrt::auto_revoke,
+@@ -335,11 +336,21 @@ void WgcSession::onFrameArrived(
+     auto timestamp = frame.SystemRelativeTime();
+     int64_t frameTimeHns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(timestamp).count();
+ 
+-    // Frame rate limiting: skip frames that arrive too soon
+-    if (lastFrameTimeHns_ > 0 && (frameTimeHns - lastFrameTimeHns_) < (frameIntervalHns_ * 7 / 10)) {
++    // Frame rate limiting: 固定节拍限流。
++    // 旧写法是「与上一帧间隔小于 0.7 个帧间隔才丢弃」，在 120/165Hz 屏上实际放行到
++    // 约 1.4 倍目标帧率，编码器白干活；这里改成按 nextFrameDueHns_ 的固定节拍放行。
++    if (nextFrameDueHns_ <= 0) {
++        nextFrameDueHns_ = frameTimeHns;
++    }
++    if (frameTimeHns < nextFrameDueHns_) {
+         frame.Close();
+         return;
+     }
++    nextFrameDueHns_ += frameIntervalHns_;
++    // 落后超过两帧（系统卡顿 / 编码变慢）时重新对齐，避免随后连续追赶补帧。
++    if (frameTimeHns - nextFrameDueHns_ > frameIntervalHns_ * 2) {
++        nextFrameDueHns_ = frameTimeHns + frameIntervalHns_;
++    }
+     lastFrameTimeHns_ = frameTimeHns;
+ 
+     auto surface = frame.Surface();
+@@ -372,3 +383,6 @@ void WgcSession::onFrameArrived(
+ 
+     frame.Close();
+ }
++
++
++
+diff --git a/electron/native/wgc-capture/src/wgc_session.h b/electron/native/wgc-capture/src/wgc_session.h
+index a2a1546..bfc80db 100644
+--- a/electron/native/wgc-capture/src/wgc_session.h
++++ b/electron/native/wgc-capture/src/wgc_session.h
+@@ -56,6 +56,8 @@ private:
+     int framePoolHeight_ = 0;
+     int64_t frameIntervalHns_ = 0;
+     int64_t lastFrameTimeHns_ = 0;
++    /** 下一帧「应到」的时间点：用固定节拍限流，避免高刷屏把 1.4 倍目标帧率灌给编码器。 */
++    int64_t nextFrameDueHns_ = 0;
+     HWND windowHandle_ = nullptr;
+     RECT monitorBounds_{};
+     RECT cropRect_{};

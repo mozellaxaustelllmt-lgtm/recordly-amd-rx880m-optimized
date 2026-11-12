@@ -1,0 +1,36 @@
+// 生成 NSIS 安装包（本地自用；跳过签名与 winCodeSign 下载）
+{
+  beforePack: "./scripts/noop-before-pack.mjs",
+  extraResources: [
+    { from: "public/wallpapers", to: "assets/wallpapers" }
+  ],
+  npmRebuild: false,
+  buildDependenciesFromSource: false,
+  asar: true,
+  asarUnpack: [
+    "node_modules/ffmpeg-static/**",
+    "node_modules/ffprobe-static/**",
+    "node_modules/uiohook-napi/**",
+    "node_modules/sherpa-onnx-*/**",
+    "electron/native/bin/**"
+  ],
+  directories: { app: "pack-staging", output: "release-nsis" },
+  win: {
+    target: [{ target: "nsis", arch: ["x64"] }],
+    icon: "icons/icons/win/icon.ico",
+    signAndEditExecutable: false,
+    artifactName: "Recordly-AMD-RyzenAI9H365-Radeon880M-Setup-${version}.${ext}",
+  },
+  nsis: {
+    oneClick: false,
+    perMachine: false,
+    allowToChangeInstallationDirectory: true,
+    createDesktopShortcut: true,
+    createStartMenuShortcut: true,
+    shortcutName: "Recordly (AMD 优化版)",
+    installerIcon: "icons/icons/win/icon.ico",
+    uninstallerIcon: "icons/icons/win/icon.ico",
+    deleteAppDataOnUninstall: false,
+    differentialPackage: false,
+  },
+}
